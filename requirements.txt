@@ -1,0 +1,7 @@
+torch>=2.0
+transformers>=4.30
+datasets
+wandb
+tqdm
+matplotlib
+numpy
