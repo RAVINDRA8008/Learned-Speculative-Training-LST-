@@ -120,9 +120,9 @@ ORIGINAL = ExperimentConfig(
 QUALITY_FOCUSED = ExperimentConfig(
     name="quality_focused",
     lst_K=5,              # 4x more supervision (every 5 steps instead of 20)
-    lst_tolerance=0.02,   # start slightly higher
-    lst_tol_min=0.02,     # FLOOR at 0.02 — never accept >2% worse than baseline
-    lst_tol_max=0.05,
+    lst_tolerance=0.005,  # 0.5% relative tolerance (tight)
+    lst_tol_min=0.003,    # FLOOR at 0.3% — at loss 7.0, threshold = 7.021
+    lst_tol_max=0.015,    # CAP at 1.5% — never more than ~0.1 headroom
     lst_draft_train_every=1,  # Train draft every supervision (more data at K=5)
 )
 

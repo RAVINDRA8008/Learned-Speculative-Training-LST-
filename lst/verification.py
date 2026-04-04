@@ -20,7 +20,7 @@ class Verifier:
         tol_min: float = 0.005,
         tol_max: float = 0.05,
         target_accept_low: float = 0.45,
-        target_accept_high: float = 0.85,
+        target_accept_high: float = 0.70,
         window_size: int = 100,
     ):
         self.tolerance = tolerance
@@ -39,14 +39,13 @@ class Verifier:
         self.total_speculative = 0
 
     def update_baseline(self, loss_val: float):
-        """Update the EMA baseline loss."""
-        if self.baseline_loss is None:
-            self.baseline_loss = loss_val
-        else:
-            self.baseline_loss = (
-                self.ema_decay * self.baseline_loss
-                + (1 - self.ema_decay) * loss_val
-            )
+        """Set baseline loss directly from real gradient step.
+
+        Direct assignment (not EMA) ensures the baseline always reflects
+        the most recent supervision loss, preventing slow-tracking drift
+        where a lagging baseline makes the threshold too permissive.
+        """
+        self.baseline_loss = loss_val
 
     def should_accept(self, verify_loss: float) -> bool:
         """
