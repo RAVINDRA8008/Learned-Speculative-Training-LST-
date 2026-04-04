@@ -44,6 +44,9 @@ class LSTTrainer:
         draft_layer_fraction: float = 0.25,
         draft_max_elements: int = 4096,
         draft_train_every: int = 2,
+        tol_min: float = 0.005,
+        tol_max: float = 0.05,
+        hybrid_switch_step: int = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -58,6 +61,9 @@ class LSTTrainer:
         self.draft_max_elements = draft_max_elements
         self.draft_train_every = draft_train_every
         self._draft_train_counter = 0
+        self.tol_min = tol_min
+        self.tol_max = tol_max
+        self.hybrid_switch_step = hybrid_switch_step
 
         # Identify target layers (only 2D weight matrices, exclude embeddings)
         self.target_layers = []
@@ -103,6 +109,8 @@ class LSTTrainer:
         self.verifier = Verifier(
             tolerance=tolerance,
             adaptive=adaptive_tolerance,
+            tol_min=tol_min,
+            tol_max=tol_max,
         )
 
         # Metrics
@@ -138,6 +146,14 @@ class LSTTrainer:
         if self.step <= self.warmup_steps:
             result = self._standard_step(batches, train_draft=True)
             result["phase"] = "warmup"
+            result["accepted"] = None
+            self._log_step(result, lr)
+            return result
+
+        # === Hybrid switch: pure standard training after switch point ===
+        if self.hybrid_switch_step is not None and self.step > self.hybrid_switch_step:
+            result = self._standard_step(batches, train_draft=False)
+            result["phase"] = "hybrid_standard"
             result["accepted"] = None
             self._log_step(result, lr)
             return result

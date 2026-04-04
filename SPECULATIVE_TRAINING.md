@@ -641,6 +641,55 @@ class LSTTrainer:
         )
         
         self.draft_optimizer.zero_grad()
+
+---
+
+## 11. Ablation Experiments
+
+We conduct five ablation studies to isolate each component's contribution and address the 12.5% loss quality gap.
+
+### Running Experiments
+
+```bash
+# On Colab A100 40GB:
+pip install transformers datasets
+git clone https://github.com/RAVINDRA8008/Learned-Speculative-Training-LST-.git LST
+cd LST && pip install -e .
+
+# Run all experiments in priority order (~3 hours for Exp 1-3):
+python experiments/run_ablations.py --experiment all
+
+# Or run individually:
+python experiments/run_ablations.py --experiment quality_focused
+python experiments/run_ablations.py --experiment hybrid --skip-baseline
+python experiments/run_ablations.py --experiment ga1
+python experiments/run_ablations.py --experiment ga2
+python experiments/run_ablations.py --experiment long_10k  # ~6 hours
+
+# Generate all ablation figures:
+python experiments/plot_ablations.py
+
+# Print results summary:
+python experiments/run_ablations.py --experiment summary
+```
+
+### Experiment Descriptions
+
+| # | Name | Config | Purpose | Est. Time |
+|---|------|--------|---------|-----------|
+| 1 | Quality-Focused | K=5, τ_min=0.02 | Target <5% loss degradation | ~75 min |
+| 2 | Hybrid Schedule | LST 80% → Std 20% | Target ~0% degradation | ~30 min |
+| 3a | GA=1 Ablation | GA=1, batch=16 | Isolate GA contribution | ~24 min |
+| 3b | GA=2 Ablation | GA=2, batch=32 | Isolate GA contribution | ~42 min |
+| 4 | Long Training | 10K steps | Acceptance stability | ~6 hours |
+
+### Key Figures Generated
+
+- `paper/figures/ablation_loss_vs_walltime.pdf` — **The key plot**: loss vs wall-clock time (fair iso-compute comparison)
+- `paper/figures/ablation_ga.pdf` — GA ablation: speedup and degradation at GA=1, 2, 4
+- `paper/figures/ablation_acceptance.pdf` — Acceptance rate comparison: K=5 vs K=20
+- `paper/figures/ablation_hybrid.pdf` — Hybrid schedule phase transitions
+- `paper/figures/ablation_long_training.pdf` — 10K-step acceptance trajectory
         draft_loss.backward()
         self.draft_optimizer.step()
     
