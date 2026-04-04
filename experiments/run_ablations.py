@@ -192,28 +192,25 @@ class StreamingTextDataset(IterableDataset):
         self.text_key = 'text'
 
         # Method 1: Try datasets library (may fail with fsspec glob bug)
-        for repo, config_name, label in [
-            ('Salesforce/wikitext', 'wikitext-103-raw-v1', 'wikitext-103'),
-            ('wikitext', 'wikitext-103-raw-v1', 'wikitext-103'),
-            ('Salesforce/wikitext', 'wikitext-2-raw-v1', 'wikitext-2'),
-            ('wikitext', 'wikitext-2-raw-v1', 'wikitext-2'),
-        ]:
-            try:
-                from datasets import load_dataset
-                self.dataset = load_dataset(
-                    repo, config_name,
-                    split=split,
-                )
-                print(f"Loaded {label} from {repo} ({split}, {len(self.dataset)} examples)")
-                break
-            except Exception as e:
-                print(f"{label} ({repo}) failed: {e}")
+        try:
+            from datasets import load_dataset
+            self.dataset = load_dataset(
+                'Salesforce/wikitext', 'wikitext-103-raw-v1',
+                split=split,
+            )
+            print(f"Loaded wikitext-103 via datasets ({split}, {len(self.dataset)} examples)")
+        except Exception as e:
+            print(f"datasets library failed: {e}")
 
-        # Method 2: Direct download from HuggingFace raw files
+        # Method 2: Download parquet via huggingface_hub (bypasses fsspec entirely)
         if self.dataset is None:
-            self.dataset = self._download_wikitext_direct(split)
+            self.dataset = self._load_via_parquet(split)
 
-        # Method 3: Synthetic fallback (should never reach here)
+        # Method 3: Download zip from S3 (original Salesforce source)
+        if self.dataset is None:
+            self.dataset = self._download_s3_zip(split)
+
+        # Method 4: Synthetic fallback
         if self.dataset is None:
             print("WARNING: All dataset loading failed! Using synthetic data (testing only)...")
             self.dataset = [
@@ -221,55 +218,90 @@ class StreamingTextDataset(IterableDataset):
                 for i in range(10000)
             ]
 
-    def _download_wikitext_direct(self, split='train'):
-        """Download wikitext-103 raw text directly via HTTP (bypasses datasets/fsspec bugs)."""
-        import urllib.request
-        import os, json
+    def _load_via_parquet(self, split='train'):
+        """Load wikitext-103 by downloading parquet file directly (no fsspec glob)."""
+        import os
+        try:
+            from huggingface_hub import hf_hub_download
+            import pandas as pd
+
+            split_files = {
+                'train': 'train-00000-of-00001.parquet',
+                'validation': 'validation-00000-of-00001.parquet',
+                'test': 'test-00000-of-00001.parquet',
+            }
+            filename = f"wikitext-103-raw-v1/{split_files.get(split, split_files['train'])}"
+
+            print(f"Downloading wikitext-103 parquet via huggingface_hub...")
+            path = hf_hub_download(
+                repo_id="Salesforce/wikitext",
+                filename=filename,
+                repo_type="dataset",
+            )
+            df = pd.read_parquet(path)
+            data = df.to_dict('records')
+            print(f"Loaded wikitext-103 ({split}, {len(data)} examples) via parquet")
+            return data
+        except Exception as e:
+            print(f"Parquet download failed: {e}")
+            # Try alternative parquet path (refs/convert/parquet branch)
+            try:
+                print(f"Trying parquet from convert branch...")
+                path = hf_hub_download(
+                    repo_id="Salesforce/wikitext",
+                    filename=filename,
+                    repo_type="dataset",
+                    revision="refs/convert/parquet",
+                )
+                df = pd.read_parquet(path)
+                data = df.to_dict('records')
+                print(f"Loaded wikitext-103 ({split}, {len(data)} examples) via parquet (convert branch)")
+                return data
+            except Exception as e2:
+                print(f"Parquet convert branch also failed: {e2}")
+        return None
+
+    def _download_s3_zip(self, split='train'):
+        """Download wikitext-103 zip from S3 (original Salesforce/MetaMind source)."""
+        import urllib.request, zipfile, io, os
 
         cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'wikitext_direct')
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(cache_dir, f'wikitext-103-{split}.txt')
 
-        # Use cached version if available
+        # Use cache if available
         if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1_000_000:
-            print(f"Loading wikitext-103 from cache: {cache_file}")
+            print(f"Loading wikitext-103 from cache...")
             with open(cache_file, 'r', encoding='utf-8') as f:
                 text = f.read()
             paragraphs = [{'text': p.strip()} for p in text.split('\n') if len(p.strip()) > 10]
             print(f"Loaded wikitext-103 ({split}, {len(paragraphs)} paragraphs) from cache")
             return paragraphs
 
-        # Map split names
-        split_file = {'train': 'wiki.train.raw', 'validation': 'wiki.valid.raw', 'test': 'wiki.test.raw'}.get(split, 'wiki.train.raw')
+        split_map = {'train': 'wiki.train.raw', 'validation': 'wiki.valid.raw', 'test': 'wiki.test.raw'}
+        target_file = split_map.get(split, 'wiki.train.raw')
 
-        urls = [
-            f"https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/{split_file}",
-            f"https://huggingface.co/datasets/wikitext/resolve/main/wikitext-103-raw-v1/{split_file}",
-            f"https://raw.githubusercontent.com/salesforce/wikitext/master/wikitext-103-raw/{split_file}",
-        ]
+        url = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip"
+        print(f"Downloading wikitext-103 zip from S3 (~183MB)...")
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                zip_data = resp.read()
+            print(f"  Downloaded {len(zip_data) / 1e6:.1f} MB, extracting...")
 
-        for url in urls:
-            try:
-                print(f"Downloading wikitext-103 from {url}...")
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    text = resp.read().decode('utf-8')
-
-                if len(text) < 1_000_000:
-                    print(f"  Download too small ({len(text)} bytes), skipping...")
-                    continue
-
-                # Cache for future use
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    f.write(text)
-
-                paragraphs = [{'text': p.strip()} for p in text.split('\n') if len(p.strip()) > 10]
-                print(f"Downloaded wikitext-103 ({split}, {len(paragraphs)} paragraphs)")
-                return paragraphs
-            except Exception as e:
-                print(f"  Direct download failed: {e}")
-
-        print("All direct download attempts failed.")
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                for name in zf.namelist():
+                    if target_file in name:
+                        text = zf.read(name).decode('utf-8')
+                        # Cache
+                        with open(cache_file, 'w', encoding='utf-8') as f:
+                            f.write(text)
+                        paragraphs = [{'text': p.strip()} for p in text.split('\n') if len(p.strip()) > 10]
+                        print(f"Loaded wikitext-103 ({split}, {len(paragraphs)} paragraphs) from S3 zip")
+                        return paragraphs
+            print(f"  Could not find {target_file} in zip")
+        except Exception as e:
+            print(f"  S3 download failed: {e}")
         return None
 
     def __iter__(self):
