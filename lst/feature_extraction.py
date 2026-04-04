@@ -28,9 +28,10 @@ class GradientHistoryBuffer:
         """Get or create a fixed random projection matrix for a layer."""
         if layer_idx not in self._proj_matrices:
             # Gaussian random projection (JL-lemma guarantee)
-            gen = torch.Generator()
-            gen.manual_seed(42 + layer_idx)  # deterministic per layer
-            mat = torch.randn(grad_numel, self.proj_dim, generator=gen, device=self.device)
+            # Generate on CPU for determinism, then move to device
+            gen = torch.Generator(device='cpu')
+            gen.manual_seed(42 + layer_idx)
+            mat = torch.randn(grad_numel, self.proj_dim, generator=gen).to(self.device)
             mat = mat / (grad_numel ** 0.5)  # normalize for variance preservation
             self._proj_matrices[layer_idx] = mat
             self._history[layer_idx] = deque(maxlen=self.history_len)
