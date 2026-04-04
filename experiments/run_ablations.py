@@ -197,7 +197,7 @@ class StreamingTextDataset(IterableDataset):
                 from datasets import load_dataset
                 self.dataset = load_dataset(
                     'wikitext', config_name,
-                    split=split, trust_remote_code=True
+                    split=split,
                 )
                 print(f"Loaded {name} ({split}, {len(self.dataset)} examples)")
                 break
