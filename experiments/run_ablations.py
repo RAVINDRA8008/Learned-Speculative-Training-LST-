@@ -127,12 +127,14 @@ QUALITY_FOCUSED = ExperimentConfig(
 )
 
 # Exp 2: Hybrid — LST for first 80%, standard for last 20%
+# Uses SAME verifier settings as quality_focused so the only variable is the hybrid switch
 HYBRID = ExperimentConfig(
     name="hybrid",
-    lst_K=20,
-    lst_tolerance=0.015,
-    lst_tol_min=0.005,
-    lst_tol_max=0.05,
+    lst_K=5,              # Same as quality_focused
+    lst_tolerance=0.005,  # Same as quality_focused
+    lst_tol_min=0.003,    # Same as quality_focused
+    lst_tol_max=0.015,    # Same as quality_focused
+    lst_draft_train_every=1,  # Same as quality_focused
     lst_hybrid_switch_step=1600,  # Switch to standard at step 1600 (80% of 2000)
 )
 
@@ -189,20 +191,22 @@ class StreamingTextDataset(IterableDataset):
         self.dataset = None
         self.text_key = 'text'
 
-        for name, config_name in [
-            ('wikitext-103', 'wikitext-103-raw-v1'),
-            ('wikitext-2', 'wikitext-2-raw-v1'),
+        for repo, config_name, label in [
+            ('Salesforce/wikitext', 'wikitext-103-raw-v1', 'wikitext-103'),
+            ('wikitext', 'wikitext-103-raw-v1', 'wikitext-103'),
+            ('Salesforce/wikitext', 'wikitext-2-raw-v1', 'wikitext-2'),
+            ('wikitext', 'wikitext-2-raw-v1', 'wikitext-2'),
         ]:
             try:
                 from datasets import load_dataset
                 self.dataset = load_dataset(
-                    'wikitext', config_name,
+                    repo, config_name,
                     split=split,
                 )
-                print(f"Loaded {name} ({split}, {len(self.dataset)} examples)")
+                print(f"Loaded {label} from {repo} ({split}, {len(self.dataset)} examples)")
                 break
             except Exception as e:
-                print(f"{name} failed: {e}")
+                print(f"{label} ({repo}) failed: {e}")
 
         if self.dataset is None:
             print("Generating synthetic data (testing only)...")
