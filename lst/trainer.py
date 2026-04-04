@@ -147,6 +147,8 @@ class LSTTrainer:
             result = self._standard_step(batches, train_draft=True)
             result["phase"] = "warmup"
             result["accepted"] = None
+            # Anchor verifier baseline to real gradient loss during warmup
+            self.verifier.update_baseline(result["loss"])
             self._log_step(result, lr)
             return result
 
@@ -163,6 +165,8 @@ class LSTTrainer:
             result = self._standard_step(batches, train_draft=True)
             result["phase"] = "forced_supervision"
             result["accepted"] = None
+            # Anchor verifier baseline to real gradient loss (prevents drift)
+            self.verifier.update_baseline(result["loss"])
             self._log_step(result, lr)
             return result
 
