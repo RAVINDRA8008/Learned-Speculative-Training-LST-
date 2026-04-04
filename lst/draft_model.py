@@ -100,6 +100,15 @@ class GradientTransformer(nn.Module):
         else:
             self.decoders = None
 
+        # Pre-compute shape groups for batched decode (layers with same shape → one bmm)
+        self._shape_groups = {}  # (d_out, d_in) -> [layer_indices]
+        if layer_dims is not None:
+            for i, (d_out, d_in) in enumerate(layer_dims):
+                key = (d_out, d_in)
+                if key not in self._shape_groups:
+                    self._shape_groups[key] = []
+                self._shape_groups[key].append(i)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -136,6 +145,39 @@ class GradientTransformer(nn.Module):
             updates.append(factors)
 
         return updates
+
+    def forward_decoded(self, layer_features: torch.Tensor) -> list:
+        """
+        Forward pass returning fully decoded weight updates via batched matmul.
+        Groups layers by shape and uses torch.bmm for efficiency — replaces
+        N individual decode_update() calls with ~4 batched operations.
+        """
+        codes = self.forward(layer_features)
+
+        if self.decoders is None or not self._shape_groups:
+            return [self.decode_update(codes[i], self.layer_dims[i] if self.layer_dims else (0, 0), i)
+                    for i in range(self.n_layers)]
+
+        decoded = [None] * self.n_layers
+
+        for (d_out, d_in), indices in self._shape_groups.items():
+            batch_codes = torch.stack([codes[i] for i in indices])  # (B, 2*rank)
+            scale_a = batch_codes[:, :self.rank]   # (B, rank)
+            scale_b = batch_codes[:, self.rank:]   # (B, rank)
+
+            # Stack basis matrices for this shape group
+            A_bases = torch.stack([self.decoders[i].A_basis for i in indices])  # (B, d_out, rank)
+            B_bases = torch.stack([self.decoders[i].B_basis for i in indices])  # (B, d_in, rank)
+
+            # Batched low-rank decode: (B, d_out, rank) @ (B, rank, d_in)
+            A = A_bases * scale_a.unsqueeze(1)
+            B = B_bases * scale_b.unsqueeze(1)
+            updates = torch.bmm(A, B.transpose(1, 2))  # (B, d_out, d_in)
+
+            for j, idx in enumerate(indices):
+                decoded[idx] = updates[j]
+
+        return decoded
 
     def decode_update(self, code: torch.Tensor, shape: tuple, layer_idx: int = None) -> torch.Tensor:
         """

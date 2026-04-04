@@ -11,7 +11,7 @@ from typing import Optional
 from lst.draft_model import GradientTransformer
 from lst.feature_extraction import FeatureExtractor
 from lst.verification import Verifier
-from lst.utils import WeightSnapshot, MetricsTracker
+from lst.utils import MetricsTracker
 
 
 class LSTTrainer:
@@ -105,9 +105,6 @@ class LSTTrainer:
             adaptive=adaptive_tolerance,
         )
 
-        # Weight snapshot for rollback
-        self.snapshot = WeightSnapshot()
-
         # Metrics
         self.metrics = MetricsTracker()
         self.step = 0
@@ -151,40 +148,44 @@ class LSTTrainer:
         return self._speculative_step(batch, lr)
 
     def _speculative_step(self, batch: dict, lr: float) -> dict:
-        """Execute a speculative training step: predict → apply → verify → accept/reject."""
+        """Execute a speculative training step: predict → apply → verify → accept/reject.
 
-        # Use cached loss from previous step (avoids redundant forward pass)
+        Optimized hot path:
+        - Batched decode via forward_decoded() (one bmm per shape group)
+        - No snapshot: rollback by reversing the update
+        - model.eval() during verify to skip gradient checkpointing overhead
+        - No .item() CUDA syncs in feature extraction
+        """
         current_loss = self._cached_loss if self._cached_loss is not None else 0.0
 
-        # Update baseline if not set
         if self.verifier.baseline_loss is None:
             self.verifier.update_baseline(current_loss)
 
         # Extract features for draft model
         features = self.feat_extractor.extract(current_loss, self.step, lr)
 
-        # Draft prediction
+        # Draft prediction → batched decoded weight updates
         self.draft.eval()
         with torch.no_grad():
-            predicted_updates = self.draft(features)
+            decoded_updates = self.draft.forward_decoded(features)
 
-        # Snapshot current weights for potential rollback
-        self.snapshot.save(self.target_layers)
+        # Apply speculative updates (cached for rollback — no snapshot needed)
+        with torch.no_grad():
+            for i, (name, param) in enumerate(self.target_layers):
+                param.data.add_(decoded_updates[i], alpha=-lr)
 
-        # Apply speculative update
-        self._apply_speculative_update(predicted_updates, lr)
-
-        # Verify via forward pass (only costly operation per accepted step)
+        # Verify via forward pass — eval mode skips gradient checkpointing overhead
+        self.model.eval()
         with torch.no_grad():
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
                 verify_output = self.model(**batch)
                 verify_loss = verify_output.loss.item()
+        self.model.train()
 
         # Accept or reject
         accepted = self.verifier.should_accept(verify_loss)
 
         if accepted:
-            # Keep the speculative update — skip backward pass entirely
             self._cached_loss = verify_loss
             result = {
                 "loss": verify_loss,
@@ -193,8 +194,12 @@ class LSTTrainer:
                 "draft_loss": None,
             }
         else:
-            # Reject: restore weights and do real training
-            self.snapshot.restore(self.target_layers)
+            # Rollback by reversing the update (exact: w + (-lr*u) + (+lr*u) = w)
+            with torch.no_grad():
+                for i, (name, param) in enumerate(self.target_layers):
+                    param.data.add_(decoded_updates[i], alpha=+lr)
+            del decoded_updates
+
             result = self._standard_step(batch, train_draft=True)
             result["accepted"] = False
             result["phase"] = "speculative_rejected"
@@ -297,14 +302,6 @@ class LSTTrainer:
             return draft_loss.item()
 
         return None
-
-    def _apply_speculative_update(self, updates: list, lr: float):
-        """Apply the draft model's predicted updates to target model weights."""
-        with torch.no_grad():
-            for i, (name, param) in enumerate(self.target_layers):
-                update = self.draft.decode_update(updates[i], param.shape, layer_idx=i)
-                # Apply as a gradient step: w = w - lr * predicted_gradient
-                param.data.add_(update, alpha=-lr)
 
     def _log_step(self, result: dict, lr: float):
         """Log metrics for this step."""

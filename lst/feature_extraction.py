@@ -167,11 +167,8 @@ class FeatureExtractor:
         for i, (name, param) in enumerate(self.target_layers):
             w = param.data
 
-            # Weight statistics (3 floats)
-            weight_stats = torch.tensor(
-                [w.mean().item(), w.std().item(), w.norm().item()],
-                device=self.device,
-            )
+            # Weight statistics — stay on GPU, NO .item() CUDA syncs
+            weight_stats = torch.stack([w.mean(), w.std(), w.norm()])
 
             # Gradient history (history_len * proj_dim floats)
             grad_hist = self.grad_buffer.get_features(i)
