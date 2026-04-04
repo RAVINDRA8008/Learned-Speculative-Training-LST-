@@ -69,7 +69,9 @@ class Verifier:
 
         if accepted:
             self.total_accepted += 1
-            self.update_baseline(verify_loss)
+            # NOTE: Do NOT update baseline from speculative accepts.
+            # Baseline is only updated from real gradient steps (warmup/supervision)
+            # to prevent cumulative drift.
 
         # Adapt tolerance after accumulating enough decisions
         if self.adaptive and len(self.recent_decisions) >= 20:
