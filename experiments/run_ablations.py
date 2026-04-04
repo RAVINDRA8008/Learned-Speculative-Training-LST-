@@ -191,6 +191,7 @@ class StreamingTextDataset(IterableDataset):
         self.dataset = None
         self.text_key = 'text'
 
+        # Method 1: Try datasets library (may fail with fsspec glob bug)
         for repo, config_name, label in [
             ('Salesforce/wikitext', 'wikitext-103-raw-v1', 'wikitext-103'),
             ('wikitext', 'wikitext-103-raw-v1', 'wikitext-103'),
@@ -208,12 +209,68 @@ class StreamingTextDataset(IterableDataset):
             except Exception as e:
                 print(f"{label} ({repo}) failed: {e}")
 
+        # Method 2: Direct download from HuggingFace raw files
         if self.dataset is None:
-            print("Generating synthetic data (testing only)...")
+            self.dataset = self._download_wikitext_direct(split)
+
+        # Method 3: Synthetic fallback (should never reach here)
+        if self.dataset is None:
+            print("WARNING: All dataset loading failed! Using synthetic data (testing only)...")
             self.dataset = [
                 {'text': f"The quick brown fox jumps over the lazy dog. Sentence {i}. " * 10}
                 for i in range(10000)
             ]
+
+    def _download_wikitext_direct(self, split='train'):
+        """Download wikitext-103 raw text directly via HTTP (bypasses datasets/fsspec bugs)."""
+        import urllib.request
+        import os, json
+
+        cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'wikitext_direct')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f'wikitext-103-{split}.txt')
+
+        # Use cached version if available
+        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1_000_000:
+            print(f"Loading wikitext-103 from cache: {cache_file}")
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                text = f.read()
+            paragraphs = [{'text': p.strip()} for p in text.split('\n') if len(p.strip()) > 10]
+            print(f"Loaded wikitext-103 ({split}, {len(paragraphs)} paragraphs) from cache")
+            return paragraphs
+
+        # Map split names
+        split_file = {'train': 'wiki.train.raw', 'validation': 'wiki.valid.raw', 'test': 'wiki.test.raw'}.get(split, 'wiki.train.raw')
+
+        urls = [
+            f"https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/{split_file}",
+            f"https://huggingface.co/datasets/wikitext/resolve/main/wikitext-103-raw-v1/{split_file}",
+            f"https://raw.githubusercontent.com/salesforce/wikitext/master/wikitext-103-raw/{split_file}",
+        ]
+
+        for url in urls:
+            try:
+                print(f"Downloading wikitext-103 from {url}...")
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    text = resp.read().decode('utf-8')
+
+                if len(text) < 1_000_000:
+                    print(f"  Download too small ({len(text)} bytes), skipping...")
+                    continue
+
+                # Cache for future use
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    f.write(text)
+
+                paragraphs = [{'text': p.strip()} for p in text.split('\n') if len(p.strip()) > 10]
+                print(f"Downloaded wikitext-103 ({split}, {len(paragraphs)} paragraphs)")
+                return paragraphs
+            except Exception as e:
+                print(f"  Direct download failed: {e}")
+
+        print("All direct download attempts failed.")
+        return None
 
     def __iter__(self):
         while True:
