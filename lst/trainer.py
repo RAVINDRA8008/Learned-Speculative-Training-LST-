@@ -110,13 +110,13 @@ class LSTTrainer:
         self.step = 0
         self.rank = rank
 
-    def step_batch(self, batch: dict, lr: float = None) -> dict:
+    def step_batch(self, batches, lr: float = None) -> dict:
         """
         Execute one LST training step.
 
         Args:
-            batch: Input batch dict (input_ids, attention_mask, labels).
-            lr:    Current learning rate (for feature extraction).
+            batches: Single batch dict or list of micro-batch dicts for gradient accumulation.
+            lr:      Current learning rate (for feature extraction).
 
         Returns:
             Dict with 'loss', 'accepted' (bool or None), 'acceptance_rate', etc.
@@ -125,12 +125,18 @@ class LSTTrainer:
         if lr is None:
             lr = self.optimizer.defaults.get("lr", 1e-4)
 
-        # Move batch to device
-        batch = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        # Normalize: accept single batch dict or list of micro-batches
+        if isinstance(batches, dict):
+            batches = [batches]
+        # Move all micro-batches to device
+        batches = [
+            {k: v.to(self.device) for k, v in b.items() if isinstance(v, torch.Tensor)}
+            for b in batches
+        ]
 
         # === Phase 1: Warmup — standard training, collect gradient data ===
         if self.step <= self.warmup_steps:
-            result = self._standard_step(batch, train_draft=True)
+            result = self._standard_step(batches, train_draft=True)
             result["phase"] = "warmup"
             result["accepted"] = None
             self._log_step(result, lr)
@@ -138,22 +144,23 @@ class LSTTrainer:
 
         # === Forced supervision every K steps ===
         if self.step % self.K == 0:
-            result = self._standard_step(batch, train_draft=True)
+            result = self._standard_step(batches, train_draft=True)
             result["phase"] = "forced_supervision"
             result["accepted"] = None
             self._log_step(result, lr)
             return result
 
         # === Phase 2: Speculative training ===
-        return self._speculative_step(batch, lr)
+        return self._speculative_step(batches, lr)
 
-    def _speculative_step(self, batch: dict, lr: float) -> dict:
+    def _speculative_step(self, batches: list, lr: float) -> dict:
         """Execute a speculative training step: predict → apply → verify → accept/reject.
 
         Optimized hot path:
         - Batched decode via forward_decoded() (one bmm per shape group)
         - No snapshot: rollback by reversing the update
         - model.eval() during verify to skip gradient checkpointing overhead
+        - Verify on FIRST micro-batch only (O(1) cost regardless of grad_accum)
         - No .item() CUDA syncs in feature extraction
         """
         current_loss = self._cached_loss if self._cached_loss is not None else 0.0
@@ -174,11 +181,11 @@ class LSTTrainer:
             for i, (name, param) in enumerate(self.target_layers):
                 param.data.add_(decoded_updates[i], alpha=-lr)
 
-        # Verify via forward pass — eval mode skips gradient checkpointing overhead
+        # Verify on FIRST micro-batch — eval mode skips gradient checkpointing
         self.model.eval()
         with torch.no_grad():
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-                verify_output = self.model(**batch)
+                verify_output = self.model(**batches[0])
                 verify_loss = verify_output.loss.item()
         self.model.train()
 
@@ -200,7 +207,7 @@ class LSTTrainer:
                     param.data.add_(decoded_updates[i], alpha=+lr)
             del decoded_updates
 
-            result = self._standard_step(batch, train_draft=True)
+            result = self._standard_step(batches, train_draft=True)
             result["accepted"] = False
             result["phase"] = "speculative_rejected"
 
@@ -212,13 +219,20 @@ class LSTTrainer:
         self._log_step(result, lr)
         return result
 
-    def _standard_step(self, batch: dict, train_draft: bool = False) -> dict:
-        """Execute a standard training step with backward pass."""
+    def _standard_step(self, batches: list, train_draft: bool = False) -> dict:
+        """Execute a standard training step with gradient accumulation over micro-batches."""
         self.optimizer.zero_grad()
-        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            output = self.model(**batch)
-            loss = output.loss
-        loss.backward()
+        n_micro = len(batches)
+        total_loss = 0.0
+
+        for micro_batch in batches:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+                output = self.model(**micro_batch)
+                scaled_loss = output.loss / n_micro
+            scaled_loss.backward()
+            total_loss += output.loss.item()
+
+        avg_loss = total_loss / n_micro
 
         # Record gradients before optimizer step
         self.feat_extractor.record_gradients()
@@ -226,7 +240,7 @@ class LSTTrainer:
         # Train draft model on real gradients
         draft_loss_val = None
         if train_draft and self.step > 10:
-            draft_loss_val = self._train_draft(loss.item())
+            draft_loss_val = self._train_draft(avg_loss)
 
         # Gradient clipping
         if self.max_grad_norm > 0:
@@ -234,10 +248,10 @@ class LSTTrainer:
 
         self.optimizer.step()
 
-        self._cached_loss = loss.item()
+        self._cached_loss = avg_loss
 
         return {
-            "loss": loss.item(),
+            "loss": avg_loss,
             "draft_loss": draft_loss_val,
         }
 
