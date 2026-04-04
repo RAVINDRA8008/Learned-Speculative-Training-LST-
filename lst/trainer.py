@@ -41,6 +41,9 @@ class LSTTrainer:
         adaptive_tolerance: bool = True,
         max_grad_norm: float = 1.0,
         use_amp: bool = False,
+        draft_layer_fraction: float = 0.25,
+        draft_max_elements: int = 4096,
+        draft_train_every: int = 2,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -51,6 +54,10 @@ class LSTTrainer:
         self.use_amp = use_amp
         self._cached_loss = None
         self.device = next(model.parameters()).device
+        self.draft_layer_fraction = draft_layer_fraction
+        self.draft_max_elements = draft_max_elements
+        self.draft_train_every = draft_train_every
+        self._draft_train_counter = 0
 
         # Identify target layers (only 2D weight matrices, exclude embeddings)
         self.target_layers = []
@@ -230,40 +237,55 @@ class LSTTrainer:
         }
 
     def _train_draft(self, loss_val: float) -> float:
-        """Train the draft model to predict real gradients (self-supervision)."""
+        """Train the draft model to predict real gradients (self-supervision).
+
+        Optimizations vs. naive version:
+        - Only trains on a random subset of layers (draft_layer_fraction)
+        - Subsamples elements for MSE instead of materializing full matrices
+        - Uses AMP for draft forward/backward
+        - Called only every draft_train_every supervision steps
+        """
+        self._draft_train_counter += 1
+        if self._draft_train_counter % self.draft_train_every != 0:
+            return None
+
         self.draft.train()
 
-        # Get current LR from optimizer
         lr = self.optimizer.param_groups[0]["lr"]
-
-        # Extract features (same as what draft would see)
         features = self.feat_extractor.extract(loss_val, self.step, lr)
 
-        # Draft prediction
-        predicted_updates = self.draft(features)
+        # Draft prediction (under AMP)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+            predicted_updates = self.draft(features)
 
-        # Compare against real gradients (projected to low-rank space)
+        # Pick a random subset of layers to train on
+        n_layers = len(self.target_layers)
+        n_sample = max(1, int(n_layers * self.draft_layer_fraction))
+        layer_indices = torch.randperm(n_layers, device='cpu')[:n_sample].tolist()
+
         draft_loss = torch.tensor(0.0, device=self.device)
         n_valid = 0
 
-        for i, (name, param) in enumerate(self.target_layers):
+        for i in layer_indices:
+            name, param = self.target_layers[i]
             if param.grad is None:
                 continue
 
-            # Get the real gradient and project to low-rank space
             real_grad = param.grad.detach()
             pred = predicted_updates[i]
 
-            # Decode the prediction using the layer-specific decoder
+            # Decode prediction
             decoded_pred = self.draft.decode_update(pred, param.shape, layer_idx=i)
-            target_grad_normalized = real_grad / (real_grad.norm() + 1e-8)
-            decoded_pred_normalized = decoded_pred / (decoded_pred.norm() + 1e-8)
 
-            # Loss: MSE on normalized gradients + direction loss
-            mse_loss = (decoded_pred - real_grad).pow(2).mean()
-            cosine_loss = 1.0 - (target_grad_normalized * decoded_pred_normalized).sum()
+            # Subsample elements for MSE instead of full-matrix comparison
+            numel = real_grad.numel()
+            if numel > self.draft_max_elements:
+                idx = torch.randint(0, numel, (self.draft_max_elements,), device=self.device)
+                mse_loss = (decoded_pred.view(-1)[idx] - real_grad.view(-1)[idx]).pow(2).mean()
+            else:
+                mse_loss = (decoded_pred - real_grad).pow(2).mean()
 
-            draft_loss = draft_loss + mse_loss + 0.1 * cosine_loss
+            draft_loss = draft_loss + mse_loss
             n_valid += 1
 
         if n_valid > 0:
