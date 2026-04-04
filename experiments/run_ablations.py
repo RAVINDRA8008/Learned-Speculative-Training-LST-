@@ -219,46 +219,58 @@ class StreamingTextDataset(IterableDataset):
             ]
 
     def _load_via_parquet(self, split='train'):
-        """Load wikitext-103 by downloading parquet file directly (no fsspec glob)."""
-        import os
+        """Load wikitext-103 by downloading parquet via HF API (no fsspec glob)."""
+        import os, json
         try:
-            from huggingface_hub import hf_hub_download
             import pandas as pd
+            import urllib.request
 
-            split_files = {
-                'train': 'train-00000-of-00001.parquet',
-                'validation': 'validation-00000-of-00001.parquet',
-                'test': 'test-00000-of-00001.parquet',
-            }
-            filename = f"wikitext-103-raw-v1/{split_files.get(split, split_files['train'])}"
+            # HF API returns the actual parquet URLs for this dataset config + split
+            api_url = f"https://huggingface.co/api/datasets/Salesforce/wikitext/parquet/wikitext-103-raw-v1/{split}"
+            print(f"Fetching parquet URLs from HF API...")
 
-            print(f"Downloading wikitext-103 parquet via huggingface_hub...")
-            path = hf_hub_download(
-                repo_id="Salesforce/wikitext",
-                filename=filename,
-                repo_type="dataset",
-            )
-            df = pd.read_parquet(path)
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            # Use HF token if available (from env or huggingface_hub login)
+            hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
+            if not hf_token:
+                try:
+                    from huggingface_hub import HfFolder
+                    hf_token = HfFolder.get_token()
+                except Exception:
+                    pass
+            if hf_token:
+                headers['Authorization'] = f'Bearer {hf_token}'
+                print("  Using HF token for authentication")
+
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                parquet_urls = json.loads(resp.read().decode('utf-8'))
+
+            print(f"  Found {len(parquet_urls)} parquet file(s), downloading...")
+
+            dfs = []
+            for i, url in enumerate(parquet_urls):
+                cache_path = os.path.join(
+                    os.path.expanduser('~'), '.cache', 'wikitext_parquet',
+                    f'{split}-{i}.parquet'
+                )
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                if not os.path.exists(cache_path):
+                    dl_req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(dl_req, timeout=300) as resp:
+                        with open(cache_path, 'wb') as f:
+                            f.write(resp.read())
+                    print(f"  Downloaded parquet {i+1}/{len(parquet_urls)}")
+                else:
+                    print(f"  Using cached parquet {i+1}/{len(parquet_urls)}")
+                dfs.append(pd.read_parquet(cache_path))
+
+            df = pd.concat(dfs, ignore_index=True)
             data = df.to_dict('records')
-            print(f"Loaded wikitext-103 ({split}, {len(data)} examples) via parquet")
+            print(f"Loaded wikitext-103 ({split}, {len(data)} examples) via HF API parquet")
             return data
         except Exception as e:
-            print(f"Parquet download failed: {e}")
-            # Try alternative parquet path (refs/convert/parquet branch)
-            try:
-                print(f"Trying parquet from convert branch...")
-                path = hf_hub_download(
-                    repo_id="Salesforce/wikitext",
-                    filename=filename,
-                    repo_type="dataset",
-                    revision="refs/convert/parquet",
-                )
-                df = pd.read_parquet(path)
-                data = df.to_dict('records')
-                print(f"Loaded wikitext-103 ({split}, {len(data)} examples) via parquet (convert branch)")
-                return data
-            except Exception as e2:
-                print(f"Parquet convert branch also failed: {e2}")
+            print(f"HF API parquet download failed: {e}")
         return None
 
     def _download_s3_zip(self, split='train'):
@@ -281,27 +293,33 @@ class StreamingTextDataset(IterableDataset):
         split_map = {'train': 'wiki.train.raw', 'validation': 'wiki.valid.raw', 'test': 'wiki.test.raw'}
         target_file = split_map.get(split, 'wiki.train.raw')
 
-        url = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip"
-        print(f"Downloading wikitext-103 zip from S3 (~183MB)...")
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                zip_data = resp.read()
-            print(f"  Downloaded {len(zip_data) / 1e6:.1f} MB, extracting...")
+        # Try both old-style and new-style S3 URLs
+        urls = [
+            "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip",
+            "https://research.metamind.io.s3.amazonaws.com/wikitext/wikitext-103-raw-v1.zip",
+        ]
+        for url in urls:
+            print(f"Downloading wikitext-103 zip from {url.split('//')[1][:40]}...")
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    zip_data = resp.read()
+                print(f"  Downloaded {len(zip_data) / 1e6:.1f} MB, extracting...")
 
-            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-                for name in zf.namelist():
-                    if target_file in name:
-                        text = zf.read(name).decode('utf-8')
-                        # Cache
-                        with open(cache_file, 'w', encoding='utf-8') as f:
-                            f.write(text)
-                        paragraphs = [{'text': p.strip()} for p in text.split('\n') if len(p.strip()) > 10]
-                        print(f"Loaded wikitext-103 ({split}, {len(paragraphs)} paragraphs) from S3 zip")
-                        return paragraphs
-            print(f"  Could not find {target_file} in zip")
-        except Exception as e:
-            print(f"  S3 download failed: {e}")
+                with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                    for name in zf.namelist():
+                        if target_file in name:
+                            text = zf.read(name).decode('utf-8')
+                            # Cache
+                            with open(cache_file, 'w', encoding='utf-8') as f:
+                                f.write(text)
+                            paragraphs = [{'text': p.strip()} for p in text.split('\n') if len(p.strip()) > 10]
+                            print(f"Loaded wikitext-103 ({split}, {len(paragraphs)} paragraphs) from S3 zip")
+                            return paragraphs
+                print(f"  Could not find {target_file} in zip")
+            except Exception as e:
+                print(f"  S3 download failed: {e}")
         return None
 
     def __iter__(self):
