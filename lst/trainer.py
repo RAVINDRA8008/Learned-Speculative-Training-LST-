@@ -40,6 +40,7 @@ class LSTTrainer:
         n_blocks: int = 4,
         adaptive_tolerance: bool = True,
         max_grad_norm: float = 1.0,
+        use_amp: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -47,15 +48,17 @@ class LSTTrainer:
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
         self.max_grad_norm = max_grad_norm
+        self.use_amp = use_amp
+        self._cached_loss = None
         self.device = next(model.parameters()).device
 
-        # Identify target layers (only 2D weight matrices for low-rank prediction)
+        # Identify target layers (only 2D weight matrices, exclude embeddings)
         self.target_layers = []
         self.all_params = []
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.all_params.append((name, param))
-                if param.dim() == 2:
+                if param.dim() == 2 and 'wte' not in name and 'wpe' not in name and 'lm_head' not in name:
                     self.target_layers.append((name, param))
 
         n_layers = len(self.target_layers)
@@ -143,10 +146,8 @@ class LSTTrainer:
     def _speculative_step(self, batch: dict, lr: float) -> dict:
         """Execute a speculative training step: predict → apply → verify → accept/reject."""
 
-        # Get current loss for baseline and features
-        with torch.no_grad():
-            output = self.model(**batch)
-            current_loss = output.loss.item()
+        # Use cached loss from previous step (avoids redundant forward pass)
+        current_loss = self._cached_loss if self._cached_loss is not None else 0.0
 
         # Update baseline if not set
         if self.verifier.baseline_loss is None:
@@ -166,16 +167,18 @@ class LSTTrainer:
         # Apply speculative update
         self._apply_speculative_update(predicted_updates, lr)
 
-        # Verify via forward pass
+        # Verify via forward pass (only costly operation per accepted step)
         with torch.no_grad():
-            verify_output = self.model(**batch)
-            verify_loss = verify_output.loss.item()
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+                verify_output = self.model(**batch)
+                verify_loss = verify_output.loss.item()
 
         # Accept or reject
         accepted = self.verifier.should_accept(verify_loss)
 
         if accepted:
             # Keep the speculative update — skip backward pass entirely
+            self._cached_loss = verify_loss
             result = {
                 "loss": verify_loss,
                 "accepted": True,
@@ -200,8 +203,9 @@ class LSTTrainer:
     def _standard_step(self, batch: dict, train_draft: bool = False) -> dict:
         """Execute a standard training step with backward pass."""
         self.optimizer.zero_grad()
-        output = self.model(**batch)
-        loss = output.loss
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+            output = self.model(**batch)
+            loss = output.loss
         loss.backward()
 
         # Record gradients before optimizer step
@@ -217,6 +221,8 @@ class LSTTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
         self.optimizer.step()
+
+        self._cached_loss = loss.item()
 
         return {
             "loss": loss.item(),
@@ -248,13 +254,8 @@ class LSTTrainer:
             real_grad = param.grad.detach()
             pred = predicted_updates[i]
 
-            # Compute target: project real gradient to same format as prediction
-            d_out, d_in = param.shape
-            rank = self.rank
-
-            # SVD-based low-rank target (compute what the "ideal" prediction would be)
-            # For efficiency, just compare the decoded prediction against real gradient
-            decoded_pred = self.draft.decode_update(pred, param.shape)
+            # Decode the prediction using the layer-specific decoder
+            decoded_pred = self.draft.decode_update(pred, param.shape, layer_idx=i)
             target_grad_normalized = real_grad / (real_grad.norm() + 1e-8)
             decoded_pred_normalized = decoded_pred / (decoded_pred.norm() + 1e-8)
 
@@ -279,7 +280,7 @@ class LSTTrainer:
         """Apply the draft model's predicted updates to target model weights."""
         with torch.no_grad():
             for i, (name, param) in enumerate(self.target_layers):
-                update = self.draft.decode_update(updates[i], param.shape)
+                update = self.draft.decode_update(updates[i], param.shape, layer_idx=i)
                 # Apply as a gradient step: w = w - lr * predicted_gradient
                 param.data.add_(update, alpha=-lr)
 

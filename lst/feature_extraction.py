@@ -16,23 +16,35 @@ class GradientHistoryBuffer:
     Gradients are compressed via a fixed random projection matrix.
     """
 
-    def __init__(self, proj_dim: int = 32, history_len: int = 4, device: str = "cpu"):
+    def __init__(self, proj_dim: int = 32, history_len: int = 4, device: str = "cpu", max_grad_elements: int = 8192):
         self.proj_dim = proj_dim
         self.history_len = history_len
         self.device = device
+        self.max_grad_elements = max_grad_elements
         self._history = {}        # layer_idx -> deque of projected gradients
         self._proj_matrices = {}  # layer_idx -> random projection matrix
         self._grad_norms = {}     # layer_idx -> deque of gradient norms
+        self._subsample_indices = {}  # layer_idx -> indices for large gradients
 
     def _get_proj_matrix(self, layer_idx: int, grad_numel: int) -> torch.Tensor:
         """Get or create a fixed random projection matrix for a layer."""
         if layer_idx not in self._proj_matrices:
+            effective_numel = min(grad_numel, self.max_grad_elements)
+
+            # Create subsample indices for large gradients
+            if grad_numel > self.max_grad_elements:
+                gen_sub = torch.Generator(device='cpu')
+                gen_sub.manual_seed(123 + layer_idx)
+                self._subsample_indices[layer_idx] = torch.randperm(
+                    grad_numel, generator=gen_sub
+                )[:self.max_grad_elements].to(self.device)
+
             # Gaussian random projection (JL-lemma guarantee)
             # Generate on CPU for determinism, then move to device
             gen = torch.Generator(device='cpu')
             gen.manual_seed(42 + layer_idx)
-            mat = torch.randn(grad_numel, self.proj_dim, generator=gen).to(self.device)
-            mat = mat / (grad_numel ** 0.5)  # normalize for variance preservation
+            mat = torch.randn(effective_numel, self.proj_dim, generator=gen).to(self.device)
+            mat = mat / (effective_numel ** 0.5)  # normalize for variance preservation
             self._proj_matrices[layer_idx] = mat
             self._history[layer_idx] = deque(maxlen=self.history_len)
             self._grad_norms[layer_idx] = deque(maxlen=self.history_len)
@@ -41,10 +53,16 @@ class GradientHistoryBuffer:
     def push(self, layer_idx: int, gradient: torch.Tensor):
         """Store a compressed version of the gradient."""
         flat = gradient.detach().flatten().to(self.device)
+        grad_norm = flat.norm().item()
         proj_mat = self._get_proj_matrix(layer_idx, flat.numel())
+
+        # Subsample if gradient is too large for full projection
+        if layer_idx in self._subsample_indices:
+            flat = flat[self._subsample_indices[layer_idx]]
+
         projected = flat @ proj_mat  # (proj_dim,)
         self._history[layer_idx].append(projected)
-        self._grad_norms[layer_idx].append(flat.norm().item())
+        self._grad_norms[layer_idx].append(grad_norm)
 
     def get_features(self, layer_idx: int) -> torch.Tensor:
         """
@@ -75,6 +93,8 @@ class GradientHistoryBuffer:
         self.device = device
         for idx in self._proj_matrices:
             self._proj_matrices[idx] = self._proj_matrices[idx].to(device)
+        for idx in self._subsample_indices:
+            self._subsample_indices[idx] = self._subsample_indices[idx].to(device)
         for idx in self._history:
             self._history[idx] = deque(
                 [h.to(device) for h in self._history[idx]],

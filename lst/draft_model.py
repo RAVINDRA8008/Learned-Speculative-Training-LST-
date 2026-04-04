@@ -10,6 +10,31 @@ import torch
 import torch.nn as nn
 
 
+class LayerDecoder(nn.Module):
+    """Decodes compact code vector into full weight update using learned basis vectors."""
+
+    def __init__(self, d_out, d_in, rank):
+        super().__init__()
+        self.rank = rank
+        self.d_out = d_out
+        self.d_in = d_in
+        self.A_basis = nn.Parameter(torch.randn(d_out, rank) * 0.01)
+        self.B_basis = nn.Parameter(torch.randn(d_in, rank) * 0.01)
+
+    def forward(self, code):
+        """
+        Args:
+            code: (2*rank,) scaling coefficients from draft head
+        Returns:
+            (d_out, d_in) weight update
+        """
+        scale_a = code[:self.rank]
+        scale_b = code[self.rank:]
+        A = self.A_basis * scale_a.unsqueeze(0)  # (d_out, rank)
+        B = self.B_basis * scale_b.unsqueeze(0)  # (d_in, rank)
+        return A @ B.T  # (d_out, d_in)
+
+
 class GradientTransformer(nn.Module):
     """
     Draft model that predicts low-rank weight updates for each layer
@@ -60,20 +85,20 @@ class GradientTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_blocks)
 
-        # Per-layer output heads
-        # Each head outputs the concatenated low-rank factors A and B
-        # for that layer's weight update: ΔW ≈ A @ B^T
+        # Compact per-layer heads: output 2*rank coefficients (NOT full factors)
+        self.heads = nn.ModuleList([
+            nn.Linear(d_model, 2 * rank)
+            for _ in range(n_layers)
+        ])
+
+        # Per-layer decoders: learned basis vectors for efficient low-rank updates
         if layer_dims is not None:
-            self.heads = nn.ModuleList([
-                nn.Linear(d_model, (d_out + d_in) * rank)
+            self.decoders = nn.ModuleList([
+                LayerDecoder(d_out, d_in, rank)
                 for d_out, d_in in layer_dims
             ])
         else:
-            # Fallback: generic output size
-            self.heads = nn.ModuleList([
-                nn.Linear(d_model, rank * 2)
-                for _ in range(n_layers)
-            ])
+            self.decoders = None
 
         self._init_weights()
 
@@ -112,35 +137,38 @@ class GradientTransformer(nn.Module):
 
         return updates
 
-    def decode_update(self, factors: torch.Tensor, shape: tuple) -> torch.Tensor:
+    def decode_update(self, code: torch.Tensor, shape: tuple, layer_idx: int = None) -> torch.Tensor:
         """
-        Decode low-rank factors into a full weight update tensor.
+        Decode compact code into a full weight update tensor via learned basis.
 
         Args:
-            factors: Raw output from a per-layer head.
-            shape:   Shape of the target parameter (e.g., (768, 768) for a linear layer).
+            code:      Compact code from a per-layer head (2*rank values).
+            shape:     Shape of the target parameter.
+            layer_idx: Index into self.decoders for basis-based decoding.
 
         Returns:
             Weight update tensor matching `shape`.
         """
+        if self.decoders is not None and layer_idx is not None:
+            return self.decoders[layer_idx](code)
+
+        # Fallback: simple outer-product approach
         if len(shape) == 2:
             d_out, d_in = shape
-            rank = self.rank
-            # Split factors into A (d_out × rank) and B (d_in × rank)
-            a = factors[:d_out * rank].view(d_out, rank)
-            b = factors[d_out * rank:(d_out + d_in) * rank].view(d_in, rank)
-            update = a @ b.T  # (d_out, d_in)
-            return update
+            half = min(self.rank, code.numel() // 2)
+            a_scale = code[:half]
+            b_scale = code[half:2 * half]
+            A = a_scale.unsqueeze(0).expand(d_out, -1) * 0.01
+            B = b_scale.unsqueeze(0).expand(d_in, -1) * 0.01
+            return A @ B.T
         elif len(shape) == 1:
-            # Bias or 1D parameter — just take first `shape[0]` values
-            return factors[:shape[0]]
+            return code[:shape[0]]
         else:
-            # Higher-dimensional parameter — flatten, fill, reshape
             numel = 1
             for s in shape:
                 numel *= s
-            flat = factors[:numel] if factors.numel() >= numel else torch.cat([
-                factors, torch.zeros(numel - factors.numel(), device=factors.device)
+            flat = code[:numel] if code.numel() >= numel else torch.cat([
+                code, torch.zeros(numel - code.numel(), device=code.device)
             ])
             return flat.view(shape)
 
